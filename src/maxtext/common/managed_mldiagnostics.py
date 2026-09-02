@@ -63,15 +63,27 @@ class ManagedMLDiagnostics:
         return False
       return True
 
-    config_dict = {key: value for key, value in config.get_keys().items() if should_log_key(key, value)}
+    if hasattr(config, "get_keys"):
+      raw_dict = config.get_keys()
+    elif hasattr(config, "model_dump"):
+      raw_dict = config.model_dump()
+    elif hasattr(config, "dict"):
+      raw_dict = config.dict()
+    elif isinstance(config, dict):
+      raw_dict = config
+    else:
+      raw_dict = dict(config)
+
+    config_dict = {key: value for key, value in raw_dict.items() if should_log_key(key, value)}
 
     # Create a run for the managed mldiagnostics, and upload the configuration.
     region = config.managed_mldiagnostics_region if config.managed_mldiagnostics_region else None
+    gcs_path = config.managed_mldiagnostics_dir or getattr(config, "base_output_directory", None)
     mldiag.machinelearning_run(
         name=f"{config.run_name}",
         run_group=config.managed_mldiagnostics_run_group,
         configs=config_dict,
-        gcs_path=config.managed_mldiagnostics_dir,
+        gcs_path=gcs_path,
         on_demand_xprof=config.managed_mldiagnostics_on_demand_profiling,
         region=region,
     )
