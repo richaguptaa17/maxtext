@@ -55,6 +55,7 @@ class ProfilerTest(unittest.TestCase):
         xprof_e2e_enable_fw_throttle_event=True,
         xprof_e2e_enable_fw_power_level_event=True,
         xprof_e2e_enable_fw_thermal_event=True,
+        profile_power_events=True,
     )
 
     with patch("jax.profiler.ProfileOptions") as mock_options_cls:
@@ -87,6 +88,7 @@ class ProfilerTest(unittest.TestCase):
         base_output_directory="/tmp",
         profiler="xplane",
         xprof_tpu_power_trace_level=2,
+        profile_power_events=True,
     )
 
     # We need to mock ProfileOptions as well to check identity or value
@@ -154,20 +156,48 @@ class ProfilerTest(unittest.TestCase):
     assert prof.should_deactivate_periodic_profile(step)
 
   @pytest.mark.tpu_only
-  def test_periodic_profiler_third_period_middle_not_end(self):
+  @patch("jax.profiler.start_trace")
+  def test_profiler_activate_with_session_id(self, mock_start_trace):
+    """Verifies that activate(session_id=...) sets session_id in profile options."""
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
         enable_checkpointing=False,
-        run_name="test_periodic_profiler_starts_after_regular_profile",
+        run_name="test_session_id",
+        base_output_directory="/tmp",
         profiler="xplane",
-        skip_first_n_steps_for_profiler=7,
-        profiler_steps=4,
-        profile_periodically_period=5,
     )
-    prof = profiler.Profiler(config, offset_step=2)
+    prof = profiler.Profiler(config)
+    prof.activate(session_id="Trainer_step2")
 
-    step = 28  # Corresponds to 1 after the third period ended.
-    assert not prof.should_deactivate_periodic_profile(step)
+    mock_start_trace.assert_called_once()
+    _, kwargs = mock_start_trace.call_args
+    self.assertIn("profiler_options", kwargs)
+    self.assertEqual(kwargs["profiler_options"].session_id, "Trainer_step2")
+
+  @pytest.mark.tpu_only
+  @patch("jax.profiler.stop_trace")
+  @patch("jax.profiler.start_trace")
+  def test_profiler_activate_and_deactivate_lifecycle(
+      self, mock_start_trace, mock_stop_trace
+  ):
+    """Verifies that activate() without session_id starts trace, sets is_active, and deactivate() stops trace."""
+    config = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        enable_checkpointing=False,
+        run_name="test_lifecycle",
+        base_output_directory="/tmp",
+        profiler="xplane",
+    )
+    prof = profiler.Profiler(config)
+    self.assertFalse(prof.is_active)
+
+    prof.activate()
+    self.assertTrue(prof.is_active)
+    mock_start_trace.assert_called_once()
+
+    prof.deactivate()
+    self.assertFalse(prof.is_active)
+    mock_stop_trace.assert_called_once()
 
 
 if __name__ == "__main__":

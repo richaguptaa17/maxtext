@@ -16,17 +16,23 @@
 
 from ctypes import cdll
 import os
-import subprocess
 import shutil
+import subprocess
+import threading
+from typing import Any
 
 import jax
 
-from maxtext.common.gcloud_stub import mldiagnostics_modules
+try:
+  from maxtext.common.gcloud_stub import mldiagnostics_modules
+  from maxtext.common.managed_mldiagnostics import ManagedMLDiagnostics
+  from maxtext.utils import max_logging
+except ImportError:
+  from maxtext.src.maxtext.common.gcloud_stub import mldiagnostics_modules
+  from maxtext.src.maxtext.common.managed_mldiagnostics import ManagedMLDiagnostics
+  from maxtext.src.maxtext.utils import max_logging
 
 mldiag, _ = mldiagnostics_modules()
-
-from maxtext.common.managed_mldiagnostics import ManagedMLDiagnostics
-from maxtext.utils import max_logging
 
 
 class Profiler:
@@ -49,6 +55,10 @@ class Profiler:
     self.managed_mldiagnostics = config.managed_mldiagnostics
     if config.managed_mldiagnostics:
       ManagedMLDiagnostics(config)  # Initialize the MLRun instance.
+
+    self._lock = threading.RLock()
+    self._is_active = False
+    self._active_session_id = None
 
     self.profiling_options = jax.profiler.ProfileOptions()
     advanced_config = {}
@@ -75,8 +85,15 @@ class Profiler:
     if advanced_config:
       self.profiling_options.advanced_configuration = advanced_config
 
-  def maybe_activate_profiler(self, step, state):
+  @property
+  def is_active(self) -> bool:
+    """Returns True if the profiler is currently tracing."""
+    with self._lock:
+      return self._is_active
+
+  def maybe_activate_profiler(self, step: int, state: Any | None = None) -> None:
     """Conditionally activates the profiler based on the current step.
+
     This method checks if the current training step matches the step designated
     for starting an initial profile, or if it meets the criteria for
     activating a new periodic profile.
@@ -85,37 +102,81 @@ class Profiler:
       optional_postfix = f"step_{step}" if self.profile_period > 0 else ""
       self.activate(blocking_object=state, optional_postfix=optional_postfix)
 
-  def activate(self, blocking_object=None, optional_postfix=""):
+  def activate(
+      self,
+      session_id: str | None = None,
+      blocking_object: Any | None = None,
+      optional_postfix: str = "",
+  ) -> None:
     """Start the profiler.
-    nsys profiler becomes no-op when libcudart.so is not available on the system."""
+
+    nsys profiler becomes no-op when libcudart.so is not available on the system.
+    """
+    if optional_postfix and not session_id:
+      session_id = optional_postfix
+    if not session_id:
+      session_id = "default_session"
+
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
 
-    if self.managed_mldiagnostics and self.mode == "xplane":
-      # Handle the special profiling logic for managed_mldiagnostics
-      if self.prof is None:
-        # Starts xprof collector.
-        # Only profiling on the first device, if not upload_all_profiler_results. None is for all devices.
-        self.prof = mldiag.xprof(process_index_list=None if self.upload_all_profiler_results else [0])
-      self.prof.start()
-      return
-
-    if not (self.upload_all_profiler_results or jax.process_index() == 0):
-      return
-    if self.mode != "":
-      self.output_path = os.path.join(self.base_output_dir, optional_postfix)
-    if self.mode == "nsys":
-      try:
-        self.libcudart = cdll.LoadLibrary("libcudart.so")
-      except Exception as e:  # pylint: disable=broad-except
-        max_logging.log(f"WARNING: Failed to load library for nsys: {e}\n" "profiler has no effect")
+    with self._lock:
+      if self._is_active:
         return
-      self.libcudart.cudaProfilerStart()
-    elif self.mode == "xplane":
-      jax.profiler.start_trace(self.output_path, profiler_options=self.profiling_options)
+      self._is_active = True
+      self._active_session_id = session_id
 
-  def maybe_deactivate_profiler(self, step, state):
+      if self.managed_mldiagnostics and self.mode == "xplane":
+        # Handle the special profiling logic for managed_mldiagnostics
+        if self.prof is None:
+          # Starts xprof collector.
+          # Only profiling on the first device, if not upload_all_profiler_results. None is for all devices.
+          self.prof = mldiag.xprof(
+              process_index_list=None
+              if self.upload_all_profiler_results
+              else [0]
+          )
+        self.prof.start(session_id=session_id)
+        return
+
+      if not (self.upload_all_profiler_results or jax.process_index() == 0):
+        return
+      if self.mode != "":
+        self.output_path = (
+            os.path.join(self.base_output_dir, session_id)
+            if session_id
+            else self.base_output_dir
+        )
+      if self.mode == "nsys":
+        try:
+          self.libcudart = cdll.LoadLibrary("libcudart.so")
+        except OSError as e:
+          max_logging.warning(
+              "Failed to load library for nsys: %s\nprofiler has no effect", e
+          )
+          return
+        self.libcudart.cudaProfilerStart()
+      elif self.mode == "xplane":
+        options = (
+            self.profiling_options
+            if self.profiling_options is not None
+            else (
+                jax.profiler.ProfileOptions()
+                if hasattr(jax.profiler, "ProfileOptions")
+                else None
+            )
+        )
+        if options is not None:
+          options.session_id = session_id
+          jax.profiler.start_trace(
+              self.base_output_dir, profiler_options=options
+          )
+        else:
+          jax.profiler.start_trace(self.output_path)
+
+  def maybe_deactivate_profiler(self, step: int, state: Any | None = None) -> None:
     """Conditionally deactivates the profiler based on the current step.
+
     This method checks if the current training step matches the step designated
     for finishing the initial profile, or if it meets the criteria for
     deactivating a periodic profile.
@@ -123,33 +184,47 @@ class Profiler:
     if self.mode != "" and (step == self.finished_initial_profile_step or self.should_deactivate_periodic_profile(step)):
       self.deactivate(blocking_object=state)
 
-  def deactivate(self, blocking_object=None):
+  def deactivate(self, blocking_object: Any | None = None) -> None:
     """End the profiler.
-    The result is uploaded to the output bucket."""
+
+    The result is uploaded to the output bucket.
+    """
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
 
-    if self.managed_mldiagnostics and self.mode == "xplane":
-      # Handle the special profileing logic for managed_mldiagnostics
-      if self.prof is not None:
-        self.prof.stop()
-      return
-
-    if not (self.upload_all_profiler_results or jax.process_index() == 0):
-      return
-    if self.mode == "nsys":
-      if self.libcudart is not None:
-        self.libcudart.cudaProfilerStop()
-      else:
-        max_logging.log("WARNING: library for nsys was not loaded \n" "profiler has no effect")
+    with self._lock:
+      if not self._is_active:
         return
-      # Popen() instead of run() for non-blocking behavior
-      if shutil.which("gcloud") is not None:
-        subprocess.Popen(["gcloud", "storage", "cp", "*nsys-rep", self.output_path])  # pylint: disable=consider-using-with
-      else:
-        max_logging.log("WARNING: gcloud is not installed or not found in the system's PATH. Skipping upload...")
-    elif self.mode == "xplane":
-      jax.profiler.stop_trace()
+      try:
+        if self.managed_mldiagnostics and self.mode == "xplane":
+          # Handle the special profiling logic for managed_mldiagnostics
+          if self.prof is not None:
+            self.prof.stop()
+          return
+
+        if not (self.upload_all_profiler_results or jax.process_index() == 0):
+          return
+        if self.mode == "nsys":
+          if self.libcudart is not None:
+            self.libcudart.cudaProfilerStop()
+          else:
+            max_logging.warning(
+                "Library for nsys was not loaded\nprofiler has no effect"
+            )
+            return
+          # Popen() instead of run() for non-blocking behavior
+          if shutil.which("gcloud") is not None:
+            subprocess.Popen(["gcloud", "storage", "cp", "*nsys-rep", self.output_path])  # pylint: disable=consider-using-with
+          else:
+            max_logging.warning(
+                "gcloud is not installed or not found in the system's"
+                " PATH. Skipping upload..."
+            )
+        elif self.mode == "xplane":
+          jax.profiler.stop_trace()
+      finally:
+        self._is_active = False
+        self._active_session_id = None
 
   def _set_first_profiler_step(self, skip_steps, start_step):
     return start_step + skip_steps
