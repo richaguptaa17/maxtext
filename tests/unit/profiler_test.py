@@ -169,6 +169,28 @@ class ProfilerTest(unittest.TestCase):
     step = 28  # Corresponds to 1 after the third period ended.
     assert not prof.should_deactivate_periodic_profile(step)
 
+  @pytest.mark.tpu_only
+  def test_profiler_activate_with_session_id(self):
+    """Verifies that activate(session_id=...) forwards session_id to mldiag.xprof."""
+    config = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        enable_checkpointing=False,
+        run_name="test_session_id",
+        base_output_directory="/tmp",
+        profiler="xplane",
+        managed_mldiagnostics=True,
+    )
+    with patch.object(profiler, "ManagedMLDiagnostics"), patch.object(
+        profiler.mldiag, "xprof"
+    ) as mock_xprof_cls:
+      mock_prof_instance = MagicMock()
+      mock_xprof_cls.return_value = mock_prof_instance
+
+      prof = profiler.Profiler(config)
+      prof.activate(session_id="Trainer_step2")
+
+      mock_prof_instance.start.assert_called_once_with(session_id="Trainer_step2")
+
 
 if __name__ == "__main__":
   unittest.main()

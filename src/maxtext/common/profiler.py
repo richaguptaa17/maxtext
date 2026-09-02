@@ -85,19 +85,20 @@ class Profiler:
       optional_postfix = f"step_{step}" if self.profile_period > 0 else ""
       self.activate(blocking_object=state, optional_postfix=optional_postfix)
 
-  def activate(self, blocking_object=None, optional_postfix=""):
+  def activate(self, blocking_object=None, optional_postfix="", session_id=None):
     """Start the profiler.
     nsys profiler becomes no-op when libcudart.so is not available on the system."""
     if self.profile_cleanly and blocking_object is not None:
       jax.block_until_ready(blocking_object)
 
+    effective_session_id = session_id or optional_postfix or None
     if self.managed_mldiagnostics and self.mode == "xplane":
       # Handle the special profiling logic for managed_mldiagnostics
       if self.prof is None:
         # Starts xprof collector.
         # Only profiling on the first device, if not upload_all_profiler_results. None is for all devices.
         self.prof = mldiag.xprof(process_index_list=None if self.upload_all_profiler_results else [0])
-      self.prof.start()
+      self.prof.start(session_id=effective_session_id)
       return
 
     if not (self.upload_all_profiler_results or jax.process_index() == 0):
