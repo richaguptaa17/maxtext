@@ -405,9 +405,27 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
   )
 
   # Setup metrics logging
-  metrics_logging_options = metrics_logger.MetricsLoggerOptions(
-      log_dir=trainer_config.tensorboard_dir, flush_every_n_steps=trainer_config.log_period
-  )
+  if getattr(trainer_config, "managed_mldiagnostics", False):
+    from maxtext.trainers.post_train.rl import mldiag_backend
+
+    backend_list = [lambda: mldiag_backend.MLDiagScalarBackend(trainer_config)]
+    if getattr(trainer_config, "enable_tensorboard", False):
+      backend_list.append(
+          lambda: metrics_logger.TensorboardBackend(
+              log_dir=trainer_config.tensorboard_dir,
+              flush_every_n_steps=trainer_config.log_period,
+          )
+      )
+    metrics_logging_options = metrics_logger.MetricsLoggerOptions(
+        log_dir=trainer_config.tensorboard_dir or "",
+        flush_every_n_steps=trainer_config.log_period,
+        backend_kwargs={"custom_backend": backend_list},
+    )
+  else:
+    metrics_logging_options = metrics_logger.MetricsLoggerOptions(
+        log_dir=trainer_config.tensorboard_dir or "",
+        flush_every_n_steps=trainer_config.log_period,
+    )
 
   profiler_options = None
   if trainer_config.profiler == "xplane":
