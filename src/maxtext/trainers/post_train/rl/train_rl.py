@@ -71,7 +71,7 @@ import functools
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.rollout import base_rollout
 from tunix.rl.grpo.grpo_learner import GrpoConfig, GrpoLearner
-from tunix.sft import metrics_logger, profiler
+from tunix.sft import metrics_logger
 import tunix.generate.utils as tunix_utils
 
 
@@ -145,6 +145,7 @@ def _tpu_inference_compat_patches():
 os.environ["TOKENIZERS_PARALLELISM"] = "0"
 
 from maxtext.common.common_types import DecoderBlockType
+from maxtext.common.profiler import Profiler
 from maxtext.configs import pyconfig, types
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
 from maxtext.integration.vllm.maxtext_vllm_rollout import MaxTextVllmRollout
@@ -427,14 +428,8 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
         flush_every_n_steps=trainer_config.log_period,
     )
 
+  # Profiler is managed via rl_cluster.profiler
   profiler_options = None
-  if trainer_config.profiler == "xplane":
-    profiler_options = profiler.ProfilerOptions(
-        log_dir=trainer_config.tensorboard_dir,
-        skip_first_n_steps=trainer_config.skip_first_n_steps_for_profiler,
-        profiler_steps=trainer_config.profiler_steps,
-        set_profile_options=False,
-    )
 
   # Parse vllm_additional_config
   rollout_additional_config = None
@@ -536,6 +531,22 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
       max_logging.log(
           "enable_tunix_perf_metrics is True but tunix.perf modules are not available, skipping Tunix-managed metrics."
       )
+
+  prof_type = getattr(
+      trainer_config.profiler, "value", str(trainer_config.profiler)
+  ).lower()
+  if "." in prof_type:
+    prof_type = prof_type.split(".")[-1]
+  rl_profiler = None
+  if prof_type and prof_type != "none":
+    start_step = getattr(trainer_config, "start_step", 0)
+    rl_profiler = Profiler(trainer_config, offset_step=start_step)
+    max_logging.info(
+        "Instantiated Maxtext profiler"
+    )
+
+  if rl_profiler is not None:
+    rl_cluster_kwargs["profiler"] = rl_profiler
 
   rl_cluster = rl_cluster_lib.RLCluster(
       actor=actor_model,
